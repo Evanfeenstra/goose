@@ -2,14 +2,15 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State, Request,
+        Request, State,
     },
+    http::StatusCode,
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
-    http::StatusCode,
-    middleware::{self, Next},
 };
+use base64::Engine;
 use futures::{sink::SinkExt, stream::StreamExt};
 use goose::agents::{Agent, AgentEvent};
 use goose::conversation::message::Message as GooseMessage;
@@ -20,7 +21,6 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::error;
-use base64::Engine;
 
 type SessionStore = Arc<RwLock<std::collections::HashMap<String, Arc<Mutex<Conversation>>>>>;
 type CancellationStore = Arc<RwLock<std::collections::HashMap<String, tokio::task::AbortHandle>>>;
@@ -131,7 +131,12 @@ async fn auth_middleware(
     Ok(response)
 }
 
-pub async fn handle_web(port: u16, host: String, open: bool, auth_token: Option<String>) -> Result<()> {
+pub async fn handle_web(
+    port: u16,
+    host: String,
+    open: bool,
+    auth_token: Option<String>,
+) -> Result<()> {
     // Setup logging
     crate::logging::setup_logging(Some("goose-web"), None)?;
 
@@ -191,7 +196,10 @@ pub async fn handle_web(port: u16, host: String, open: bool, auth_token: Option<
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{session_id}", get(get_session))
         .route("/static/{*path}", get(serve_static))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
