@@ -15,7 +15,7 @@ use super::formats::anthropic::{
     create_request_with_options, response_to_streaming_message, thinking_type,
     AnthropicFormatOptions, ThinkingType,
 };
-use super::inventory::{config_secret_value, serialize_string_map, InventoryIdentityInput};
+use super::inventory::{config_secret_value, InventoryIdentityInput};
 use super::openai_compatible::handle_status;
 use super::openai_compatible::map_http_error_to_provider_error;
 use super::retry::ProviderRetry;
@@ -69,7 +69,22 @@ impl AnthropicProvider {
         let model = model.with_fast(ANTHROPIC_DEFAULT_FAST_MODEL, ANTHROPIC_PROVIDER_NAME)?;
 
         let config = crate::config::Config::global();
-        let api_key: String = config.get_secret("ANTHROPIC_API_KEY")?;
+        // Use `get_secrets` so that when ANTHROPIC_API_KEY comes from the
+        // environment, ANTHROPIC_CUSTOM_HEADERS is also read from the
+        // environment (and not from the keyring with a stale value).
+        // Mirrors providers/openai.rs.
+        let secrets = config
+            .get_secrets("ANTHROPIC_API_KEY", &["ANTHROPIC_CUSTOM_HEADERS"])
+            .map_err(|e| anyhow::anyhow!("Failed to read Anthropic secrets: {}", e))?;
+        let api_key: String = secrets
+            .get("ANTHROPIC_API_KEY")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("ANTHROPIC_API_KEY is not set"))?;
+        let custom_headers: Option<std::collections::HashMap<String, String>> = secrets
+            .get("ANTHROPIC_CUSTOM_HEADERS")
+            .cloned()
+            .map(parse_custom_headers);
+
         let host: String = config
             .get_param("ANTHROPIC_HOST")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
@@ -79,8 +94,18 @@ impl AnthropicProvider {
             key: api_key,
         };
 
-        let api_client =
+        let mut api_client =
             ApiClient::new(host, auth)?.with_header("anthropic-version", ANTHROPIC_API_VERSION)?;
+
+        if let Some(headers) = &custom_headers {
+            let mut header_map = reqwest::header::HeaderMap::new();
+            for (key, value) in headers {
+                let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())?;
+                let header_value = reqwest::header::HeaderValue::from_str(value)?;
+                header_map.insert(header_name, header_value);
+            }
+            api_client = api_client.with_headers(header_map)?;
+        }
 
         Ok(Self {
             api_client,
@@ -253,6 +278,7 @@ impl ProviderDef for AnthropicProvider {
                     Some("https://api.anthropic.com"),
                     false,
                 ),
+                ConfigKey::new("ANTHROPIC_CUSTOM_HEADERS", false, true, None, false),
             ],
         )
         .with_setup_steps(vec![
@@ -287,10 +313,10 @@ impl ProviderDef for AnthropicProvider {
         if let Some(api_key) = config_secret_value(config, "ANTHROPIC_API_KEY") {
             identity = identity.with_secret("api_key", api_key);
         }
-        if let Ok(headers) = config
-            .get_secret::<std::collections::HashMap<String, String>>("ANTHROPIC_CUSTOM_HEADERS")
-        {
-            identity = identity.with_secret("headers", serialize_string_map(&headers)?);
+        // Stored as a `KEY=VALUE,KEY=VALUE` string (see `parse_custom_headers`).
+        // Pass through verbatim — matches providers/openai.rs.
+        if let Some(custom_headers) = config_secret_value(config, "ANTHROPIC_CUSTOM_HEADERS") {
+            identity = identity.with_secret("custom_headers", custom_headers);
         }
 
         Ok(identity)
@@ -386,6 +412,28 @@ impl Provider for AnthropicProvider {
         }))
     }
 }
+
+/// Parse a comma-separated `KEY=VALUE,KEY=VALUE` header string into a map.
+///
+/// Mirrors the parser used by `providers::openai::parse_custom_headers` so
+/// that `ANTHROPIC_CUSTOM_HEADERS` and `OPENAI_CUSTOM_HEADERS` accept the
+/// same syntax (as documented in `documentation/docs/getting-started/providers.md`).
+/// Malformed entries (missing `=`) are silently skipped, matching the
+/// existing OpenAI behaviour.
+fn parse_custom_headers(s: String) -> std::collections::HashMap<String, String> {
+    s.split(',')
+        .filter_map(|header| {
+            let mut parts = header.splitn(2, '=');
+            let key = parts.next().map(|s| s.trim().to_string())?;
+            let value = parts.next().map(|s| s.trim().to_string())?;
+            if key.is_empty() {
+                return None;
+            }
+            Some((key, value))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +523,48 @@ mod tests {
         assert!(
             msg.contains("dynamic_models: false"),
             "error message should mention dynamic_models: false; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_custom_headers_parses_csv() {
+        let headers = parse_custom_headers("X-Foo=bar,X-Baz=qux".to_string());
+        assert_eq!(headers.get("X-Foo"), Some(&"bar".to_string()));
+        assert_eq!(headers.get("X-Baz"), Some(&"qux".to_string()));
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn parse_custom_headers_trims_whitespace() {
+        let headers = parse_custom_headers("  X-Foo = bar , X-Baz= qux ".to_string());
+        assert_eq!(headers.get("X-Foo"), Some(&"bar".to_string()));
+        assert_eq!(headers.get("X-Baz"), Some(&"qux".to_string()));
+    }
+
+    #[test]
+    fn parse_custom_headers_skips_malformed_entries() {
+        // Entries without `=` are silently dropped (matches OpenAI behaviour).
+        let headers = parse_custom_headers("X-Foo=bar,no-equals-here,X-Baz=qux".to_string());
+        assert_eq!(headers.get("X-Foo"), Some(&"bar".to_string()));
+        assert_eq!(headers.get("X-Baz"), Some(&"qux".to_string()));
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[test]
+    fn parse_custom_headers_handles_empty_string() {
+        let headers = parse_custom_headers(String::new());
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parse_custom_headers_allows_equals_in_value() {
+        // Only the first `=` is treated as the separator (splitn(2, '='));
+        // any further `=` in the value is preserved verbatim. This matches
+        // base64-encoded auth tokens, JWTs, etc.
+        let headers = parse_custom_headers("Authorization=Bearer abc=def==".to_string());
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&"Bearer abc=def==".to_string())
         );
     }
 }
